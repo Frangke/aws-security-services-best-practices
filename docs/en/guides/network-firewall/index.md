@@ -13,7 +13,7 @@ This guide is geared towards security practitioners who are responsible for moni
 * [Implementation](#implementation)
 * [Operationalizing](#operationalizing)
   * [Ensure Symmetric Routing](#ensure-symmetric-routing)
-  * [Use Strict rule ordering and 'Application drop established' and 'Application alert established' default firewall policy actions](#use-strict-rule-ordering-and-application-drop-established-and-application-alert-established-default-firewall-policy-actions)
+  * [Use Strict rule ordering and 'Drop established' or 'Application drop established' with corresponding 'Alert' default actions](#use-strict-rule-ordering-and-drop-established-or-application-drop-established-with-corresponding-alert-default-actions)
   * [Use Stateful rules over Stateless rules](#use-stateful-rules-over-stateless-rules)
   * [Use Custom Suricata rules instead of UI generated rules](#use-custom-suricata-rules-instead-of-ui-generated-rules)
   * [Use as few Custom Rule Groups as possible](#use-as-few-custom-rule-groups-as-possible)
@@ -82,17 +82,36 @@ When using [AWS Transit Gateway (TGW)](https://aws.amazon.com/transit-gateway/) 
 
 If appliance mode is not enabled, the return path traffic could land on an endpoint in a different AZ, which will prevent the Network Firewall from correctly evaluating the traffic against the firewall policy.
 
-### Use Strict rule ordering and 'Application drop established' and 'Application alert established' default firewall policy actions
+### Use Strict rule ordering and 'Drop established' or 'Application drop established' with corresponding 'Alert' default actions
 
 * In Network Firewall there are two options for how the Suricata engine is going to process rules.
-  * The “Strict” option is recommended because it instructs Suricata to process the rules in the order you have defined.
-  * The “Action Order” option supports Suricata’s default rule processing which is appropriate for IDS use cases but is not a good fit for typical firewall use cases.
-* When selecting Strict rule-ordering you are also able to select a “Default” action, or actions that are run at the end of your rules and will be applied to any traffic not matching earlier rules.
+  * The "Strict" option is recommended because it instructs Suricata to process the rules in the order you have defined.
+  * The "Action Order" option supports Suricata's default rule processing which is appropriate for IDS use cases but is not a good fit for typical firewall use cases.
+* When selecting Strict rule ordering you are also able to select "Default" actions that are run at the end of your rules and will be applied to any traffic not matching earlier rules. There are two main approaches:
 
-![ANF Stateful Rule evaluation](../../images/nfw-default-actions.png)
+#### Why 'Drop established' over 'Drop all'
 
-*Figure 3: Network Firewall Stateful Rule evaluation*
+"Drop established" is recommended over "Drop all" because it allows the Suricata engine to perform layer 7 inspection before making a drop decision. This is critical for pass rules that match on domain information in TLS SNI and HTTP host header fields — with "Drop all", traffic would be dropped before Suricata has a chance to inspect these application layer attributes.
 
+#### Drop established
+
+"Drop established" is the simpler option and a good starting point for most deployments. It drops any established connection traffic that doesn't match an earlier rule, while still allowing the layer 7 inspection needed for domain-based filtering. Be sure to also select the corresponding "Alert established" action — without it, traffic dropped by the default action will not be logged. "Alert established" can also be selected on its own without a drop action, which is useful for seeing what traffic would be dropped before enforcing the rule.
+
+![Network Firewall Drop Established default actions](../../images/nfw-drop-established.png)
+
+*Figure 3a: Network Firewall Drop Established default actions*
+
+#### Application drop established
+
+"Application drop established" is designed for environments where TLS Client Hello messages may be fragmented across multiple packets, which is increasingly common with post-quantum hybrid cipher key exchanges. Instead of dropping traffic immediately after the TCP handshake, it waits until it has seen enough of the application layer data (such as the TLS SNI field) before making a drop decision.
+
+![Network Firewall Application Drop Established default actions](../../images/nfw-app-drop-established.png)
+
+*Figure 3b: Network Firewall Application Drop Established default actions*
+
+If you use "Application drop established", be aware that it can drop TCP flow control packets (such as window updates, keep-alives, and resets) that occur after the TCP handshake but before a pass rule applies. You may need custom rules to allow these packets. See the [Evaluation order for stateful rule groups](https://docs.aws.amazon.com/network-firewall/latest/developerguide/suricata-rule-evaluation-order.html) documentation for details.
+
+Alternatively, the Egress Default Block Rules in the [custom Suricata rules template](#use-custom-suricata-rules-instead-of-ui-generated-rules) included in this guide apply the same application-layer-aware drop strategy using custom rules, without requiring separate rules for TCP flow control packets.
 
 ### Use Stateful rules over Stateless rules
 
@@ -133,6 +152,8 @@ The pros of using customer Suricata rules:
 * Easy to switch rule(s) from one rule group to another (blue-green testing for example)
 * Allow for adding the very important keyword: “flow:to_server” to rules easily
 
+To assist customers in writing their custom Suricata rules, we created the [Suricata Rule Generator for AWS Network Firewall Open Source application](https://github.com/aws-samples/sample-suricata-generator)
+
 Below we have also included a custom template for an egress security use case to show examples of custom suricata rules.
 
 ```
@@ -140,7 +161,7 @@ Below we have also included a custom template for an egress security use case to
 # This template will not work well with the "Drop All" or "Drop Established" default firewall policy actions.
 # Make sure the $HOME_NET variable is set correctly (do this at the firewall policy level so all Rule Groups inherit it)
 
-# Silently allow TCP 3-way handshake to be setup by $HOME_NET clients
+# Silently allow TCP 3-way handshake to be setup by $HOME_NET clients so that the domain filtering rules will work properly
 # Do not move this section, it's important that this be at the top of the entire firewall ruleset to reduce rule conflicts
 pass tcp $HOME_NET any -> any any (flow:not_established, to_server; sid:202501021;)
 pass tcp any any -> $HOME_NET any (flow:not_established, to_client; sid:202501022;)
@@ -159,11 +180,36 @@ reject tls $HOME_NET any -> any any (ja4.hash; content:"_"; startswith; content:
 drop ip $HOME_NET any -> any any (msg:"Egress traffic to RU IP"; geoip:dst,RU; metadata:geo RU; flow:to_server; sid:202501028;)
 drop ip $HOME_NET any -> any any (msg:"Egress traffic to CN IP"; geoip:dst,CN; metadata:geo CN; flow:to_server; sid:202501029;)
 
+# Block higher risk domain categories
+reject tls $HOME_NET any -> any any (msg:"Category:Command and Control"; aws_domain_category:Command and Control; ja4.hash; content:"_"; flow:to_server; sid:202602061;)
+reject tls $HOME_NET any -> any any (msg:"Category:Hacking"; aws_domain_category:Hacking; ja4.hash; content:"_"; flow:to_server; sid:202602062;)
+reject tls $HOME_NET any -> any any (msg:"Category:Malicious"; aws_domain_category:Malicious; ja4.hash; content:"_"; flow:to_server; sid:202602063;)
+reject tls $HOME_NET any -> any any (msg:"Category:Malware"; aws_domain_category:Malware; ja4.hash; content:"_"; flow:to_server; sid:202602064;)
+reject tls $HOME_NET any -> any any (msg:"Category:Phishing"; aws_domain_category:Phishing; ja4.hash; content:"_"; flow:to_server; sid:202602065;)
+reject tls $HOME_NET any -> any any (msg:"Category:Proxy Avoidance"; aws_domain_category:Proxy Avoidance; ja4.hash; content:"_"; flow:to_server; sid:202602066;)
+reject tls $HOME_NET any -> any any (msg:"Category:Spam"; aws_domain_category:Spam; ja4.hash; content:"_"; flow:to_server; sid:202602067;)
+reject http $HOME_NET any -> any any (msg:"Category:Command and Control"; aws_url_category:Command and Control; flow:to_server; sid:202602068;)
+reject http $HOME_NET any -> any any (msg:"Category:Hacking"; aws_url_category:Hacking; flow:to_server; sid:202602069;)
+reject http $HOME_NET any -> any any (msg:"Category:Malicious"; aws_url_category:Malicious; flow:to_server; sid:2026020610;)
+reject http $HOME_NET any -> any any (msg:"Category:Malware"; aws_url_category:Malware; flow:to_server; sid:2026020611;)
+reject http $HOME_NET any -> any any (msg:"Category:Phishing"; aws_url_category:Phishing; flow:to_server; sid:2026020612;)
+reject http $HOME_NET any -> any any (msg:"Category:Proxy Avoidance"; aws_url_category:Proxy Avoidance; flow:to_server; sid:2026020613;)
+reject http $HOME_NET any -> any any (msg:"Category:Spam"; aws_url_category:Spam; flow:to_server; sid:2026020614;)
+
+
 # Block higher risk ccTLDs
 reject tls $HOME_NET any -> any any (tls.sni; content:".ru"; nocase; endswith; msg:"Egress traffic to RU ccTLD"; flow:to_server; sid:202501036;)
 reject http $HOME_NET any -> any any (http.host; content:".ru"; endswith; msg:"Egress traffic to RU ccTLD"; flow:to_server; sid:202501037;)
 reject tls $HOME_NET any -> any any (tls.sni; content:".cn"; nocase; endswith; msg:"Egress traffic to CN ccTLD"; flow:to_server; sid:202501038;)
 reject http $HOME_NET any -> any any (http.host; content:".cn"; endswith; msg:"Egress traffic to CN ccTLD"; flow:to_server; sid:202501039;)
+
+# Block high risk TLDs
+reject tls $HOME_NET any -> any any (tls.sni; content:".xyz"; nocase; endswith; msg:"High risk TLD .xyz blocked"; flow:to_server; sid:202501040;)
+reject http $HOME_NET any -> any any (http.host; content:".xyz"; endswith; msg:"High risk TLD .xyz blocked"; flow:to_server; sid:202501041;)
+reject tls $HOME_NET any -> any any (tls.sni; content:".info"; nocase; endswith; msg:"High risk TLD .info blocked"; flow:to_server; sid:202501042;)
+reject http $HOME_NET any -> any any (http.host; content:".info"; endswith; msg:"High risk TLD .info blocked"; flow:to_server; sid:202501043;)
+reject tls $HOME_NET any -> any any (tls.sni; content:".top"; nocase; endswith; msg:"High risk TLD .top blocked"; flow:to_server; sid:202501044;)
+reject http $HOME_NET any -> any any (http.host; content:".top"; endswith; msg:"High risk TLD .top blocked"; flow:to_server; sid:202501045;)
 
 # Block QUICK traffic
 drop quic $HOME_NET any -> any any (msg:"QUIC traffic blocked"; flow:to_server; sid:3898932;)
@@ -185,22 +231,12 @@ reject ssh $HOME_NET any -> any !22 (msg:"Egress SSH but not port TCP/22"; flow:
 pass ntp $HOME_NET any -> any 123 (flow:to_server; sid:202501034;)
 pass icmp $HOME_NET any -> any any (flow:to_server; sid:202501035;)
 
-# Block high risk TLDs
-reject tls $HOME_NET any -> any any (tls.sni; content:".xyz"; nocase; endswith; msg:"High risk TLD .xyz blocked"; flow:to_server; sid:202501040;)
-reject http $HOME_NET any -> any any (http.host; content:".xyz"; endswith; msg:"High risk TLD .xyz blocked"; flow:to_server; sid:202501041;)
-reject tls $HOME_NET any -> any any (tls.sni; content:".info"; nocase; endswith; msg:"High risk TLD .info blocked"; flow:to_server; sid:202501042;)
-reject http $HOME_NET any -> any any (http.host; content:".info"; endswith; msg:"High risk TLD .info blocked"; flow:to_server; sid:202501043;)
-reject tls $HOME_NET any -> any any (tls.sni; content:".top"; nocase; endswith; msg:"High risk TLD .top blocked"; flow:to_server; sid:202501044;)
-reject http $HOME_NET any -> any any (http.host; content:".top"; endswith; msg:"High risk TLD .top blocked"; flow:to_server; sid:202501045;)
-
 # Alert on requests to possible suspicious TLDs
 alert tls $HOME_NET any -> any any (tls.sni; pcre:"/^(?!.*\.(com|org|net|io|edu|aws)$).*/i"; msg:"Request to possible suspicious TLDs"; flow:to_server; sid:202501065;)
 alert http $HOME_NET any -> any any (http.host; pcre:"/^(?!.*\.(com|org|net|io|edu|aws)$).*/i"; msg:"Request to possible suspicious TLDs"; flow:to_server; sid:202501066;)
 
-
 # Silently (do not log) allow AWS public service endpoints that we have not setup VPC endpoints for yet
 # VPC endpoints are highly encouraged. They reduce NFW data processing costs and allow for additional security features like VPC endpoint policies.
-
 pass tls $HOME_NET any -> any any (tls.sni; content:"ec2messages."; startswith; nocase; content:".amazonaws.com"; endswith; nocase; flow:to_server; sid:202501047;)
 pass tls $HOME_NET any -> any any (tls.sni; content:"ssm."; startswith; nocase; content:".amazonaws.com"; endswith; nocase; flow:to_server; sid:202501048;)
 pass tls $HOME_NET any -> any any (tls.sni; content:"ssmmessages."; startswith; nocase; content:".amazonaws.com"; endswith; nocase; flow:to_server; sid:202501049;)
@@ -223,9 +259,12 @@ pass tls $HOME_NET any -> any any (alert; msg:"www.example2.com allowed"; tls.sn
 # When using 'dotprefix': Always place it before 'content' and always include the leading dot in the domain name (.amazon.com in the following example)
 pass tls $HOME_NET any -> any any (tls.sni; dotprefix; content:".amazon.com"; nocase; endswith; flow:to_server; sid:202501078;)
 
-# Custom Block Rules
-# These replace "Drop All" or "Drop Established" default actions
 
+
+#
+# Custom Block Rules
+# These replace "Drop All" or "Drop Established" or "Application drop established" default actions
+#
 # Egress Default Block Rules
 reject tls $HOME_NET any -> any any (msg:"Default Egress HTTPS Reject"; ssl_state:client_hello; ja4.hash; content:"_"; flowbits:set,blocked; flow:to_server; sid:999991;)
 alert tls $HOME_NET any -> any any (msg:"X25519Kyber768"; flowbits:isnotset,blocked; flowbits:set,X25519Kyber768; noalert; flow:to_server; sid:999993;)
@@ -245,6 +284,11 @@ drop tcp any any -> $HOME_NET any (msg:"Default Ingress TCP Drop"; flowbits:isno
 drop udp any any -> $HOME_NET any (msg:"Default Ingress UDP Drop"; flow:to_server; sid:9999913;)
 drop icmp any any -> $HOME_NET any (msg:"Default Ingress ICMP Drop"; flow:to_server; sid:9999914;)
 drop ip any any -> $HOME_NET any (msg:"Default Ingress All Other IP Drop"; ip_proto:!TCP; ip_proto:!UDP; ip_proto:!ICMP; flow:to_server; sid:9999915;)
+
+# The following rules alert you if they see traffic not to or from $HOME_NET (meaning $HOME_NET probably isn't set correctly)
+alert ip $HOME_NET any -> any any (noalert; flowbits:set,egress_from_home_net; flow:to_server; sid:8925324;)
+alert ip any any -> $HOME_NET any (noalert; flowbits:set,ingress_to_home_net; flow:to_server; sid:8923323;)
+alert ip any any -> any any (msg:"$HOME_NET may not be set right! Set it at the firewall policy level."; flowbits:isnotset,ingress_to_home_net; flowbits:isnotset,egress_from_home_net; threshold: type limit, track by_both, seconds 600, count 1; flow:to_server; sid:8923283;)
 ```
 
 ### Use as few Custom Rule Groups as possible
